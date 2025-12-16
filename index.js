@@ -3,39 +3,33 @@ const fs = require('fs')
 const chalk = require('chalk')
 const NodeCache = require('node-cache')
 const pino = require('pino')
-const readline = require('readline')
 const { rmSync } = require('fs')
 const store = require('./lib/lightweight_store')
 const settings = require('./settings')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main')
-const PhoneNumber = require('awesome-phonenumber')
 const { smsg } = require('./lib/myfunc')
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, jidDecode, jidNormalizedUser, makeCacheableSignalKeyStore, delay } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, jidDecode, delay } = require('@whiskeysockets/baileys')
 
-/* ===================== GLOBAL SINGLETONS ===================== */
-let xeonSocket = null
+/* ================= SINGLETON GUARDS ================= */
+let sock = null
 let isStarting = false
 let reconnecting = false
 
-/* ===================== STORE ===================== */
+/* ================= STORE ================= */
 store.readFromFile()
 setInterval(() => store.writeToFile(), 10_000)
 
-/* ===================== MEMORY SAFETY ===================== */
+/* ================= MEMORY SAFETY ================= */
 setInterval(() => {
   const used = process.memoryUsage().rss / 1024 / 1024
   if (used > 650) {
-    console.log('⚠️ High RAM, restarting safely')
+    console.log('⚠️ High RAM usage, restarting')
     process.exit(1)
   }
 }, 30_000)
 
-/* ===================== CLI INPUT ===================== */
-const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
-const question = (q) => rl ? new Promise(r => rl.question(q, r)) : Promise.resolve(settings.ownerNumber)
-
-/* ===================== MAIN BOT ===================== */
-async function startXeonBotInc() {
+/* ================= START BOT ================= */
+async function startBot() {
   if (isStarting) return
   isStarting = true
 
@@ -44,14 +38,14 @@ async function startXeonBotInc() {
     const { state, saveCreds } = await useMultiFileAuthState('./session')
     const msgRetryCounterCache = new NodeCache()
 
-    const sock = makeWASocket({
+    sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: true,
+      printQRInTerminal: true,          // ✅ QR ONLY
       browser: ['Ubuntu', 'Chrome', '20'],
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }))
+        keys: state.keys
       },
       markOnlineOnConnect: false,
       syncFullHistory: false,
@@ -59,25 +53,24 @@ async function startXeonBotInc() {
       keepAliveIntervalMs: 25_000
     })
 
-    xeonSocket = sock
     isStarting = false
     reconnecting = false
 
     sock.ev.on('creds.update', saveCreds)
     store.bind(sock.ev)
 
-    sock.decodeJid = (jid) => {
+    sock.decodeJid = jid => {
       if (!jid) return jid
       if (/:\\d+@/gi.test(jid)) {
         const d = jidDecode(jid) || {}
-        return (d.user && d.server) ? `${d.user}@${d.server}` : jid
+        return d.user && d.server ? `${d.user}@${d.server}` : jid
       }
       return jid
     }
 
-    sock.serializeM = (m) => smsg(sock, m, store)
+    sock.serializeM = m => smsg(sock, m, store)
 
-    /* ===================== MESSAGES ===================== */
+    /* ================= MESSAGES ================= */
     sock.ev.on('messages.upsert', async ({ messages }) => {
       const m = messages?.[0]
       if (!m?.message) return
@@ -89,10 +82,12 @@ async function startXeonBotInc() {
       }
     })
 
-    /* ===================== CONNECTION ===================== */
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
+    /* ================= CONNECTION ================= */
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      if (qr) console.log(chalk.yellow('📱 Scan the QR from WhatsApp → Linked Devices'))
+
       if (connection === 'open') {
-        console.log(chalk.green('✅ WhatsApp Connected'))
+        console.log(chalk.green('✅ WhatsApp Connected Successfully'))
       }
 
       if (connection === 'close') {
@@ -109,29 +104,28 @@ async function startXeonBotInc() {
 
         if (!reconnecting) {
           reconnecting = true
-          console.log('🔄 Reconnecting in 8s...')
+          console.log('🔄 Reconnecting in 8 seconds...')
           await delay(8000)
-          startXeonBotInc()
+          startBot()
         }
       }
     })
 
-    /* ===================== GROUP / STATUS ===================== */
-    sock.ev.on('group-participants.update', async (u) => handleGroupParticipantUpdate(sock, u).catch(() => {}))
-    sock.ev.on('status.update', async (s) => handleStatus(sock, s).catch(() => {}))
-    sock.ev.on('messages.reaction', async (r) => handleStatus(sock, r).catch(() => {}))
+    /* ================= GROUP / STATUS ================= */
+    sock.ev.on('group-participants.update', u => handleGroupParticipantUpdate(sock, u).catch(() => {}))
+    sock.ev.on('status.update', s => handleStatus(sock, s).catch(() => {}))
+    sock.ev.on('messages.reaction', r => handleStatus(sock, r).catch(() => {}))
 
   } catch (e) {
     console.error('Fatal start error:', e)
     isStarting = false
     await delay(10_000)
-    startXeonBotInc()
+    startBot()
   }
 }
 
-/* ===================== START ===================== */
-startXeonBotInc()
+/* ================= RUN ================= */
+startBot()
 
-/* ===================== SAFETY ===================== */
-process.on('uncaughtException', err => console.error(err))
-process.on('unhandledRejection', err => console.error(err))
+process.on('uncaughtException', e => console.error(e))
+process.on('unhandledRejection', e => console.error(e))
