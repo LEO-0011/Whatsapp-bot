@@ -1,10 +1,3 @@
-/**
- * index.js (cleaned & optimized)
- * - Removes forwarded/channel metadata that triggers "View channel"
- * - Safer reconnection handling
- * - Memory checks and minor optimizations
- */
-
 require('./settings');
 const { Boom } = require('@hapi/boom');
 const fs = require('fs');
@@ -20,6 +13,17 @@ const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('
 const PhoneNumber = require('awesome-phonenumber');
 const { smsg } = require('./lib/myfunc');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, jidDecode, jidNormalizedUser, makeCacheableSignalKeyStore, delay } = require('@whiskeysockets/baileys');
+
+// ========== GET PHONE NUMBER FROM ENVIRONMENT VARIABLE ==========
+// Set PAIR_NUMBER in Render Dashboard -> Environment tab
+// Example: PAIR_NUMBER=911234567890 (without + or spaces)
+const phoneNumber = process.env.PAIR_NUMBER || settings.ownerNumber || "";
+
+if (!phoneNumber) {
+  console.log(chalk.red('❌ ERROR: PAIR_NUMBER environment variable is not set!'));
+  console.log(chalk.yellow('Please set PAIR_NUMBER in Render Dashboard -> Environment tab'));
+  console.log(chalk.yellow('Example: PAIR_NUMBER=911234567890 (without + or spaces)'));
+}
 
 // Basic store init & periodic save
 store.readFromFile();
@@ -41,7 +45,6 @@ setInterval(() => {
   }
 }, 30_000);
 
-let phoneNumber = settings.ownerNumber || "911234567890";
 let owner = {};
 try { owner = JSON.parse(fs.readFileSync('./data/owner.json')); } catch (e) { owner = settings.ownerNumber || phoneNumber; }
 
@@ -49,12 +52,6 @@ global.botname = settings.botName || "KNIGHT BOT";
 global.themeemoji = settings.themeEmoji || "•";
 const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code");
 const useMobile = process.argv.includes("--mobile");
-
-const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
-const question = (text) => {
-  if (rl) return new Promise((resolve) => rl.question(text, resolve));
-  return Promise.resolve(settings.ownerNumber || phoneNumber);
-};
 
 async function startXeonBotInc() {
   try {
@@ -118,15 +115,28 @@ async function startXeonBotInc() {
     XeonBotInc.public = true;
     XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store);
 
-    // pairing code flow (if enabled)
+    // ========== PAIRING CODE FLOW (AUTOMATIC - NO USER INPUT NEEDED) ==========
     if (pairingCode && !XeonBotInc.authState.creds.registered) {
       if (useMobile) throw new Error('Cannot use pairing code with mobile api');
 
-      let phoneNumberInput = !!global.phoneNumber ? global.phoneNumber : await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 6281376552730 (without + or spaces) : `)));
+      // Get phone number from environment variable (no user input required)
+      let phoneNumberInput = process.env.PAIR_NUMBER || phoneNumber;
+      
+      if (!phoneNumberInput) {
+        console.log(chalk.red('❌ ERROR: No phone number provided!'));
+        console.log(chalk.yellow('Set PAIR_NUMBER environment variable in Render Dashboard'));
+        console.log(chalk.yellow('Example: PAIR_NUMBER=911234567890'));
+        process.exit(1);
+      }
+
       phoneNumberInput = phoneNumberInput.replace(/[^0-9]/g, '');
+      console.log(chalk.green(`📱 Using phone number from ENV: ${phoneNumberInput}`));
+      
       const pn = require('awesome-phonenumber');
       if (!pn('+' + phoneNumberInput).isValid()) {
-        console.log(chalk.red('Invalid phone number. Please enter your full international number without + or spaces.'));
+        console.log(chalk.red('❌ Invalid phone number format!'));
+        console.log(chalk.yellow('Please use international format without + or spaces'));
+        console.log(chalk.yellow('Example: 911234567890 for India, 12025551234 for USA'));
         process.exit(1);
       }
 
@@ -134,8 +144,13 @@ async function startXeonBotInc() {
         try {
           let code = await XeonBotInc.requestPairingCode(phoneNumberInput);
           code = code?.match(/.{1,4}/g)?.join("-") || code;
-          console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)));
-          console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`));
+          console.log(chalk.bgGreen.black(`\n✅ YOUR PAIRING CODE: ${code}\n`));
+          console.log(chalk.yellow(`📲 Steps to link your WhatsApp:`));
+          console.log(chalk.cyan(`   1. Open WhatsApp on your phone`));
+          console.log(chalk.cyan(`   2. Go to Settings > Linked Devices`));
+          console.log(chalk.cyan(`   3. Tap "Link a Device"`));
+          console.log(chalk.cyan(`   4. Enter code: ${code}`));
+          console.log(chalk.yellow(`\n⏳ Waiting for you to enter the code...`));
         } catch (error) {
           console.error('Error requesting pairing code:', error);
           console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'));
