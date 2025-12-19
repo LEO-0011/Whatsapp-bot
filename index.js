@@ -8,30 +8,21 @@ const store = require('./lib/lightweight_store')
 const settings = require('./settings')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main')
 const { smsg } = require('./lib/myfunc')
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, jidDecode, delay } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, delay } = require('@whiskeysockets/baileys')
 
-/* ================= SINGLETON GUARDS ================= */
-let sock = null
-let isStarting = false
+/* ================= SINGLE INSTANCE GUARD ================= */
+let sock
+let starting = false
 let reconnecting = false
 
 /* ================= STORE ================= */
 store.readFromFile()
 setInterval(() => store.writeToFile(), 10_000)
 
-/* ================= MEMORY SAFETY ================= */
-setInterval(() => {
-  const used = process.memoryUsage().rss / 1024 / 1024
-  if (used > 650) {
-    console.log('⚠️ High RAM usage, restarting')
-    process.exit(1)
-  }
-}, 30_000)
-
 /* ================= START BOT ================= */
 async function startBot() {
-  if (isStarting) return
-  isStarting = true
+  if (starting) return
+  starting = true
 
   try {
     const { version } = await fetchLatestBaileysVersion()
@@ -41,34 +32,48 @@ async function startBot() {
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: true,          // ✅ QR ONLY
-      browser: ['Ubuntu', 'Chrome', '20'],
+      printQRInTerminal: false,     // ❌ NO QR
       auth: {
         creds: state.creds,
-        keys: state.keys
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }))
       },
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
+      browser: ['Ubuntu', 'Chrome', '20'],
       msgRetryCounterCache,
       keepAliveIntervalMs: 25_000
     })
 
-    isStarting = false
+    starting = false
     reconnecting = false
 
     sock.ev.on('creds.update', saveCreds)
     store.bind(sock.ev)
 
-    sock.decodeJid = jid => {
-      if (!jid) return jid
-      if (/:\\d+@/gi.test(jid)) {
-        const d = jidDecode(jid) || {}
-        return d.user && d.server ? `${d.user}@${d.server}` : jid
-      }
-      return jid
-    }
-
     sock.serializeM = m => smsg(sock, m, store)
+
+    /* ================= PAIRING CODE LOGIN ================= */
+    if (!state.creds.registered) {
+      const phone = (process.env.PAIRING_NUMBER || '').replace(/[^0-9]/g, '')
+
+      if (!phone) {
+        console.error('❌ PAIRING_NUMBER env variable not set')
+        process.exit(1)
+      }
+
+      console.log(chalk.yellow('📲 Requesting pairing code...'))
+
+      const code = await sock.requestPairingCode(phone)
+      const formatted = code?.match(/.{1,4}/g)?.join('-') || code
+
+      console.log('\n==============================')
+      console.log('🔑 PAIRING CODE:', chalk.green(formatted))
+      console.log('==============================\n')
+
+      console.log(
+        chalk.cyan(
+          'WhatsApp → Settings → Linked Devices → Link a device → Link with phone number'
+        )
+      )
+    }
 
     /* ================= MESSAGES ================= */
     sock.ev.on('messages.upsert', async ({ messages }) => {
@@ -83,9 +88,7 @@ async function startBot() {
     })
 
     /* ================= CONNECTION ================= */
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-      if (qr) console.log(chalk.yellow('📱 Scan the QR from WhatsApp → Linked Devices'))
-
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
       if (connection === 'open') {
         console.log(chalk.green('✅ WhatsApp Connected Successfully'))
       }
@@ -97,14 +100,13 @@ async function startBot() {
         try { sock.ws?.close() } catch {}
 
         if (code === DisconnectReason.loggedOut || code === 401) {
-          console.log('🧹 Logged out, deleting session')
           rmSync('./session', { recursive: true, force: true })
           process.exit(1)
         }
 
         if (!reconnecting) {
           reconnecting = true
-          console.log('🔄 Reconnecting in 8 seconds...')
+          console.log('🔄 Reconnecting in 8s...')
           await delay(8000)
           startBot()
         }
@@ -117,8 +119,8 @@ async function startBot() {
     sock.ev.on('messages.reaction', r => handleStatus(sock, r).catch(() => {}))
 
   } catch (e) {
-    console.error('Fatal start error:', e)
-    isStarting = false
+    console.error('Fatal error:', e)
+    starting = false
     await delay(10_000)
     startBot()
   }
@@ -126,6 +128,5 @@ async function startBot() {
 
 /* ================= RUN ================= */
 startBot()
-
 process.on('uncaughtException', e => console.error(e))
 process.on('unhandledRejection', e => console.error(e))
