@@ -14,9 +14,12 @@ const PhoneNumber = require('awesome-phonenumber');
 const { smsg } = require('./lib/myfunc');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, jidDecode, jidNormalizedUser, makeCacheableSignalKeyStore, delay } = require('@whiskeysockets/baileys');
 
+// ========== PREVENT MULTIPLE CONNECTIONS ==========
+let isConnecting = false;
+let connectionAttempts = 0;
+const MAX_RETRIES = 5;
+
 // ========== GET PHONE NUMBER FROM ENVIRONMENT VARIABLE ==========
-// Set PAIR_NUMBER in Render Dashboard -> Environment tab
-// Example: PAIR_NUMBER=911234567890 (without + or spaces)
 const phoneNumber = process.env.PAIR_NUMBER || settings.ownerNumber || "";
 
 if (!phoneNumber) {
@@ -53,7 +56,36 @@ global.themeemoji = settings.themeEmoji || "•";
 const pairingCode = !!phoneNumber || process.argv.includes("--pairing-code");
 const useMobile = process.argv.includes("--mobile");
 
+// ========== CLEAR SESSION FUNCTION ==========
+function clearSession() {
+  try {
+    const sessionPath = './session';
+    if (fs.existsSync(sessionPath)) {
+      rmSync(sessionPath, { recursive: true, force: true });
+      console.log(chalk.yellow('🗑️ Session folder deleted. Will create new session.'));
+    }
+  } catch (error) {
+    console.error('Error clearing session:', error);
+  }
+}
+
 async function startXeonBotInc() {
+  // Prevent multiple simultaneous connection attempts
+  if (isConnecting) {
+    console.log(chalk.yellow('⏳ Already connecting... Please wait.'));
+    return;
+  }
+
+  if (connectionAttempts >= MAX_RETRIES) {
+    console.log(chalk.red('❌ Max connection attempts reached. Clearing session and restarting...'));
+    clearSession();
+    connectionAttempts = 0;
+    await delay(10000);
+  }
+
+  isConnecting = true;
+  connectionAttempts++;
+
   try {
     let { version } = await fetchLatestBaileysVersion();
     const { state, saveCreds } = await useMultiFileAuthState(`./session`);
@@ -79,7 +111,8 @@ async function startXeonBotInc() {
       msgRetryCounterCache,
       defaultQueryTimeoutMs: 60000,
       connectTimeoutMs: 60000,
-      keepAliveIntervalMs: 10000,
+      keepAliveIntervalMs: 25000,  // Increased to reduce conflicts
+      retryRequestDelayMs: 2000,
     });
 
     // persist creds
@@ -115,11 +148,10 @@ async function startXeonBotInc() {
     XeonBotInc.public = true;
     XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store);
 
-    // ========== PAIRING CODE FLOW (AUTOMATIC - NO USER INPUT NEEDED) ==========
+    // ========== PAIRING CODE FLOW (AUTOMATIC) ==========
     if (pairingCode && !XeonBotInc.authState.creds.registered) {
       if (useMobile) throw new Error('Cannot use pairing code with mobile api');
 
-      // Get phone number from environment variable (no user input required)
       let phoneNumberInput = process.env.PAIR_NUMBER || phoneNumber;
       
       if (!phoneNumberInput) {
@@ -171,7 +203,6 @@ async function startXeonBotInc() {
           return;
         }
 
-        // Block direct DMs when bot is in private mode (keeps groups)
         if (!XeonBotInc.public && !mek.key.fromMe && chatUpdate.type === 'notify') {
           const isGroup = mek.key?.remoteJid?.endsWith('@g.us');
           if (!isGroup) return;
@@ -179,16 +210,14 @@ async function startXeonBotInc() {
 
         if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return;
 
-        // Clear retry cache to avoid memory bloat
         if (XeonBotInc?.msgRetryCounterCache) XeonBotInc.msgRetryCounterCache.clear();
 
         try {
           await handleMessages(XeonBotInc, chatUpdate, true);
         } catch (err) {
           console.error("Error in handleMessages:", err);
-          // send a minimal error message (no forwarded/channel metadata)
           try {
-            const target = mek.key && mek.key.remoteJid ? mek.key.remoteJid : (Array.isArray(XeonBotInc.user?.id) ? XeonBotInc.user.id : undefined);
+            const target = mek.key && mek.key.remoteJid ? mek.key.remoteJid : undefined;
             if (target) {
               await XeonBotInc.sendMessage(mek.key.remoteJid, {
                 text: '❌ An error occurred while processing your message.'
@@ -201,7 +230,7 @@ async function startXeonBotInc() {
       }
     });
 
-    // Connection updates
+    // ========== CONNECTION UPDATES WITH CONFLICT HANDLING ==========
     XeonBotInc.ev.on('connection.update', async (s) => {
       const { connection, lastDisconnect, qr } = s;
 
@@ -209,12 +238,13 @@ async function startXeonBotInc() {
       if (connection === 'connecting') console.log(chalk.yellow('🔄 Connecting to WhatsApp...'));
 
       if (connection === 'open') {
+        isConnecting = false;
+        connectionAttempts = 0;  // Reset on successful connection
         console.log(chalk.magenta(' '));
         console.log(chalk.yellow('🌿Connected to => ' + JSON.stringify(XeonBotInc.user, null, 2)));
 
         try {
           const botNumber = XeonBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
-          // CLEAN: simple text-only connection message (no forward/channel metadata)
           await XeonBotInc.sendMessage(botNumber, {
             text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!\n\n💙 KnightBot MD is Active!`
           }).catch(() => {});
@@ -234,29 +264,68 @@ async function startXeonBotInc() {
       }
 
       if (connection === 'close') {
-        const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+        isConnecting = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(chalk.red(`Connection closed due to ${lastDisconnect?.error}, reconnecting ${shouldReconnect}`));
+        const errorMessage = lastDisconnect?.error?.message || '';
+        
+        console.log(chalk.red(`Connection closed. Status: ${statusCode}, Error: ${errorMessage}`));
 
+        // Handle different disconnect reasons
         if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-          try {
-            rmSync('./session', { recursive: true, force: true });
-            console.log(chalk.yellow('Session folder deleted. Please re-authenticate.'));
-          } catch (error) {
-            console.error('Error deleting session:', error);
-          }
-          console.log(chalk.red('Session logged out. Please re-authenticate.'));
+          console.log(chalk.red('🔴 Session logged out. Clearing session...'));
+          clearSession();
+          connectionAttempts = 0;
+          console.log(chalk.yellow('Please redeploy to get a new pairing code.'));
+          process.exit(1);  // Exit so Render can restart fresh
+        } 
+        else if (statusCode === DisconnectReason.connectionClosed || 
+                 statusCode === DisconnectReason.connectionLost ||
+                 statusCode === DisconnectReason.timedOut) {
+          console.log(chalk.yellow('🟡 Connection lost. Reconnecting...'));
+          const retryDelay = Math.min(5000 * connectionAttempts, 30000);  // Max 30 seconds
+          await delay(retryDelay);
+          startXeonBotInc();
         }
-
-        if (shouldReconnect) {
-          console.log(chalk.yellow('Reconnecting...'));
+        else if (statusCode === DisconnectReason.connectionReplaced || 
+                 errorMessage.includes('conflict')) {
+          console.log(chalk.red('🔴 Connection conflict detected!'));
+          console.log(chalk.yellow('Another device/instance is using this WhatsApp session.'));
+          console.log(chalk.yellow('Make sure no other WhatsApp Web sessions are active.'));
+          
+          // Wait longer before retry to avoid rapid conflicts
+          console.log(chalk.yellow('Waiting 30 seconds before retry...'));
+          await delay(30000);
+          
+          if (connectionAttempts >= 3) {
+            console.log(chalk.red('Too many conflicts. Clearing session...'));
+            clearSession();
+            connectionAttempts = 0;
+            process.exit(1);
+          }
+          startXeonBotInc();
+        }
+        else if (statusCode === DisconnectReason.badSession || 
+                 errorMessage.includes('Bad MAC')) {
+          console.log(chalk.red('🔴 Bad session detected. Clearing session...'));
+          clearSession();
+          connectionAttempts = 0;
           await delay(5000);
           startXeonBotInc();
+        }
+        else {
+          // Generic reconnection for other errors
+          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+          if (shouldReconnect) {
+            const retryDelay = Math.min(5000 * connectionAttempts, 30000);
+            console.log(chalk.yellow(`Reconnecting in ${retryDelay/1000} seconds...`));
+            await delay(retryDelay);
+            startXeonBotInc();
+          }
         }
       }
     });
 
-    // Anticall handler (clean, non-spammy)
+    // Anticall handler
     const antiCallNotified = new Set();
     XeonBotInc.ev.on('call', async (calls) => {
       try {
@@ -291,8 +360,10 @@ async function startXeonBotInc() {
     return XeonBotInc;
 
   } catch (error) {
+    isConnecting = false;
     console.error('Error in startXeonBotInc:', error);
-    await delay(5000);
+    const retryDelay = Math.min(5000 * connectionAttempts, 30000);
+    await delay(retryDelay);
     startXeonBotInc();
   }
 }
