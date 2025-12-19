@@ -8,12 +8,20 @@ const store = require('./lib/lightweight_store')
 const settings = require('./settings')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main')
 const { smsg } = require('./lib/myfunc')
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore, delay } = require('@whiskeysockets/baileys')
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  delay
+} = require('@whiskeysockets/baileys')
 
-/* ================= SINGLE INSTANCE GUARD ================= */
-let sock
+/* ================= GLOBAL FLAGS ================= */
+let sock = null
 let starting = false
 let reconnecting = false
+let pairingInProgress = false
 
 /* ================= STORE ================= */
 store.readFromFile()
@@ -32,14 +40,16 @@ async function startBot() {
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: false,     // ❌ NO QR
+      printQRInTerminal: false, // ❌ QR disabled
+      browser: ['Ubuntu', 'Chrome', '20'],
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }))
       },
-      browser: ['Ubuntu', 'Chrome', '20'],
       msgRetryCounterCache,
-      keepAliveIntervalMs: 25_000
+      keepAliveIntervalMs: 25_000,
+      markOnlineOnConnect: false,
+      syncFullHistory: false
     })
 
     starting = false
@@ -47,32 +57,33 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds)
     store.bind(sock.ev)
-
     sock.serializeM = m => smsg(sock, m, store)
 
     /* ================= PAIRING CODE LOGIN ================= */
     if (!state.creds.registered) {
-      const phone = (process.env.PAIRING_NUMBER || '').replace(/[^0-9]/g, '')
+      pairingInProgress = true
 
+      const phone = (process.env.PAIRING_NUMBER || '').replace(/[^0-9]/g, '')
       if (!phone) {
         console.error('❌ PAIRING_NUMBER env variable not set')
         process.exit(1)
       }
 
-      console.log(chalk.yellow('📲 Requesting pairing code...'))
-
+      console.log('📲 Requesting pairing code...')
       const code = await sock.requestPairingCode(phone)
       const formatted = code?.match(/.{1,4}/g)?.join('-') || code
 
       console.log('\n==============================')
       console.log('🔑 PAIRING CODE:', chalk.green(formatted))
       console.log('==============================\n')
+      console.log('⏳ Waiting up to 3 minutes for WhatsApp confirmation')
+      console.log('⚠️ DO NOT redeploy or restart during this time')
 
-      console.log(
-        chalk.cyan(
-          'WhatsApp → Settings → Linked Devices → Link a device → Link with phone number'
-        )
-      )
+      // ⏱️ Give WhatsApp enough time (3 minutes)
+      setTimeout(() => {
+        pairingInProgress = false
+        console.log('⌛ Pairing window expired (if not confirmed)')
+      }, 180_000)
     }
 
     /* ================= MESSAGES ================= */
@@ -90,6 +101,7 @@ async function startBot() {
     /* ================= CONNECTION ================= */
     sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
       if (connection === 'open') {
+        pairingInProgress = false
         console.log(chalk.green('✅ WhatsApp Connected Successfully'))
       }
 
@@ -99,15 +111,22 @@ async function startBot() {
 
         try { sock.ws?.close() } catch {}
 
+        // 🚫 DO NOT reconnect while pairing
+        if (pairingInProgress) {
+          console.log('⏳ Pairing in progress — waiting, not reconnecting')
+          return
+        }
+
         if (code === DisconnectReason.loggedOut || code === 401) {
+          console.log('🧹 Logged out, deleting session')
           rmSync('./session', { recursive: true, force: true })
           process.exit(1)
         }
 
         if (!reconnecting) {
           reconnecting = true
-          console.log('🔄 Reconnecting in 8s...')
-          await delay(8000)
+          console.log('🔄 Reconnecting in 15 seconds...')
+          await delay(15_000)
           startBot()
         }
       }
