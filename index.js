@@ -1,9 +1,9 @@
 require('./settings')
 const fs = require('fs')
+const express = require('express')
 const chalk = require('chalk')
 const NodeCache = require('node-cache')
 const pino = require('pino')
-const { rmSync } = require('fs')
 const store = require('./lib/lightweight_store')
 const settings = require('./settings')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main')
@@ -17,11 +17,16 @@ const {
   delay
 } = require('@whiskeysockets/baileys')
 
+/* ================= WEB SERVER (UPTIME) ================= */
+const app = express()
+app.get('/', (_, res) => res.status(200).send('OK'))
+app.get('/health', (_, res) => res.json({ status: 'alive', uptime: process.uptime() }))
+app.listen(process.env.PORT || 3000, () => console.log('🌐 Web server running'))
+
 /* ================= GLOBAL FLAGS ================= */
-let sock = null
+let sock
 let starting = false
 let reconnecting = false
-let pairingInProgress = false
 
 /* ================= STORE ================= */
 store.readFromFile()
@@ -33,6 +38,12 @@ async function startBot() {
   starting = true
 
   try {
+    // ❗ Ensure session exists
+    if (!fs.existsSync('./session/creds.json')) {
+      console.error('❌ creds.json not found in session folder')
+      process.exit(1)
+    }
+
     const { version } = await fetchLatestBaileysVersion()
     const { state, saveCreds } = await useMultiFileAuthState('./session')
     const msgRetryCounterCache = new NodeCache()
@@ -40,7 +51,7 @@ async function startBot() {
     sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
-      printQRInTerminal: false, // ❌ QR disabled
+      printQRInTerminal: false, // ❌ NO QR
       browser: ['Ubuntu', 'Chrome', '20'],
       auth: {
         creds: state.creds,
@@ -59,33 +70,6 @@ async function startBot() {
     store.bind(sock.ev)
     sock.serializeM = m => smsg(sock, m, store)
 
-    /* ================= PAIRING CODE LOGIN ================= */
-    if (!state.creds.registered) {
-      pairingInProgress = true
-
-      const phone = (process.env.PAIRING_NUMBER || '').replace(/[^0-9]/g, '')
-      if (!phone) {
-        console.error('❌ PAIRING_NUMBER env variable not set')
-        process.exit(1)
-      }
-
-      console.log('📲 Requesting pairing code...')
-      const code = await sock.requestPairingCode(phone)
-      const formatted = code?.match(/.{1,4}/g)?.join('-') || code
-
-      console.log('\n==============================')
-      console.log('🔑 PAIRING CODE:', chalk.green(formatted))
-      console.log('==============================\n')
-      console.log('⏳ Waiting up to 3 minutes for WhatsApp confirmation')
-      console.log('⚠️ DO NOT redeploy or restart during this time')
-
-      // ⏱️ Give WhatsApp enough time (3 minutes)
-      setTimeout(() => {
-        pairingInProgress = false
-        console.log('⌛ Pairing window expired (if not confirmed)')
-      }, 180_000)
-    }
-
     /* ================= MESSAGES ================= */
     sock.ev.on('messages.upsert', async ({ messages }) => {
       const m = messages?.[0]
@@ -101,7 +85,6 @@ async function startBot() {
     /* ================= CONNECTION ================= */
     sock.ev.on('connection.update', async ({ connection, lastDisconnect }) => {
       if (connection === 'open') {
-        pairingInProgress = false
         console.log(chalk.green('✅ WhatsApp Connected Successfully'))
       }
 
@@ -111,15 +94,9 @@ async function startBot() {
 
         try { sock.ws?.close() } catch {}
 
-        // 🚫 DO NOT reconnect while pairing
-        if (pairingInProgress) {
-          console.log('⏳ Pairing in progress — waiting, not reconnecting')
-          return
-        }
-
+        // If session is invalid, stop (do NOT loop)
         if (code === DisconnectReason.loggedOut || code === 401) {
-          console.log('🧹 Logged out, deleting session')
-          rmSync('./session', { recursive: true, force: true })
+          console.error('❌ Session logged out. Re-upload valid session.')
           process.exit(1)
         }
 
